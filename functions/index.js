@@ -1,38 +1,33 @@
 import { onRequest } from "firebase-functions/v2/https";
-import admin from "firebase-admin";
-import speech from "@google-cloud/speech";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import { VertexAI } from "@google-cloud/vertexai";
-import serviceAccount from "./key.json" with { type: "json" };
 import mainServiceAccount from "./key2.json" with { type: "json" };
 import { google } from "googleapis";
-import os from "os";
-import path from "path";
-import fs from "fs";
 import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    storageBucket: "stt-notes-474506.firebasestorage.app",
-});
+let supabase;
 
-const speechClient = new speech.SpeechClient();
+const getSupabase = () => {
+    if (!supabase) {
+        supabase = createSupabaseClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_ANON_KEY
+        );
+    }
+};
 
-const vertexAI = new VertexAI({
-    project: "forestfoods",
-    location: 'us-central1',
-    googleAuthOptions: {
-        keyFilename: "./sac2.json",
-        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-    },
-});
-
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
-
-async function processTranscriptWithVertexAI({ transcript: rawTranscript, name, tracks, nextSessionPlans }) {
+async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript: rawTranscript, name, tracks, nextSessionPlans }) {
     try {
+        const vertexAI = new VertexAI({
+            project: "forestfoods",
+            location: 'us-central1',
+            googleAuthOptions: {
+                credentials: VERTEX_CREDENTIALS_JSON,
+                scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+            },
+        });
+
         const generativeModel = vertexAI.getGenerativeModel({
             model: 'gemini-2.5-flash',
             generationConfig: {
@@ -121,7 +116,6 @@ async function processTranscriptWithVertexAI({ transcript: rawTranscript, name, 
         const response = result.response;
         const text = response.candidates[0].content.parts[0].text;
         
-        // Clean up the response (remove markdown code blocks if present)
         let cleanedText = text.trim();
         if (cleanedText.startsWith('```json')) {
             cleanedText = cleanedText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
@@ -140,147 +134,71 @@ async function processTranscriptWithVertexAI({ transcript: rawTranscript, name, 
     }
 }
 
-export const generateTranscript = onRequest({ memory: "512MiB" }, async(request, response) => {
+export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async(request, response) => {
+    const VERTEX_CREDENTIALS_JSON = process.env.VERTEX_CREDENTIALS_JSON;
+    getSupabase();
+
     if (request.method !== "POST") {
         return response.status(405).send("Method Not Allowed");
     }
 
     const authHeader = request.headers.authorization || "";
+
     const match = authHeader.match(/^Bearer (.*)$/);
     if (!match) {
-        return response.status(401).json({ success: false, message: "Not authorized to access this route" });
+        return response
+        .status(401)
+        .json({ success: false, message: "Not authorized to access this route" });
     }
 
-    const idToken = match[1];
-    let decodedToken;
+    const accessToken = match[1];
 
-    try {
-        decodedToken = await admin.auth().verifyIdToken(idToken);
-    } catch (error) {
-        return response.status(403).json({ success: false, message: "Not authorized to access this route" });
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken);
+
+    if (error || !user) {
+    return response
+        .status(403)
+        .json({ success: false, message: "Not authorized to access this route" });
     }
 
-    const { audioUrl, childId, sessionId, name, tracks, nextSessionPlans } = request.body;
-    if (!audioUrl || !childId || !sessionId || !name || !tracks) {
+    const { transcript, sessionId, name, tracks, nextSessionPlans } = request.body;
+    if (!transcript || !sessionId || !name || !tracks) {
         return response.status(400).json({ success: false, message: "Missing details in request body" });
     }
 
     try {
 
-        const bucket = admin.storage().bucket();
+    const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans });
 
-        let filePath;
-
-        if (audioUrl.includes('/o/')) {
-            // Extract path after /o/
-            const pathMatch = audioUrl.match(/\/o\/([^?]+)/);
-            if (pathMatch) {
-                filePath = decodeURIComponent(pathMatch[1]);
-            }
-        } else {
-            throw new Error('Invalid Firebase Storage URL format');
-        }
-
-        // Create temporary file paths
-        const tempDir = os.tmpdir();
-        const inputFilePath = path.join(tempDir, `input_${Date.now()}.aac`);
-        const outputFilePath = path.join(tempDir, `output_${Date.now()}.wav`);
-
-        // Download file from Firebase Storage using Admin SDK
-        await bucket.file(filePath).download({
-            destination: inputFilePath,
-        });
-
-        // Convert audio to WAV format (16kHz, mono, 16-bit PCM)
-        await convertAudioToWav(inputFilePath, outputFilePath);
-
-        // Read the converted audio file
-        const audioBytes = fs.readFileSync(outputFilePath);
-
-        // Configure Speech-to-Text request
-        const audio = {
-            content: audioBytes.toString('base64'),
-        };
-
-        const config = {
-            encoding: 'LINEAR16',
-            sampleRateHertz: 16000,
-            languageCode: 'en-US',
-            enableAutomaticPunctuation: true,
-            model: 'default',
-            useEnhanced: true,
-        };
-
-        const request = {
-            audio: audio,
-            config: config,
-        };
-
-        // Perform speech recognition
-        const [response2] = await speechClient.recognize(request);
-
-        // Extract transcript
-        const transcript = response2.results.map((result) => result.alternatives[0].transcript).join('\n');
-
-        const vertexResult = await processTranscriptWithVertexAI({ transcript, name, tracks, nextSessionPlans });
-        
-        // Clean up temporary files
-        fs.unlinkSync(inputFilePath);
-        fs.unlinkSync(outputFilePath);
-
-        // Update session in Firestore if sessionId provided
-        if (sessionId) {
-            await admin.firestore().collection('sessions').doc(sessionId).update({
-                transcript: transcript,
-                formattedConversation: vertexResult?.parsedResult?.formattedConversation || "",
+    if (sessionId) {
+        const { error } = await supabase
+            .from('sessions')
+            .update({
+                formatted_conversation: vertexResult?.parsedResult?.formattedConversation || "",
                 summary: vertexResult?.parsedResult?.summary || "",
-                url: vertexResult?.url || "",
-                totalBilledTime: response2?.totalBilledTime || 0,
-                // transcriptGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
+                doc_url: vertexResult?.url || "",
+            })
+            .eq('id', sessionId);
+
+        if (error) {
+            console.error("Supabase Write Error:", error);
+            throw new Error(error.message);
         }
-
-        return response.status(200).json({
-            success: true,
-            transcript: transcript,
-            formattedConversation: vertexResult?.parsedResult?.formattedConversation || "",
-            url: vertexResult?.url || "",
-            message: 'Transcript generated successfully',
-        });
-    } catch (error) {
-        console.error('Error generating transcript:', error);
-
-        // Return specific error messages
-        if (error.code === 3) {
-            return response.status(400).send("Audio file is too large or invalid format");
-        }
-
-        return response.status(400).send(`Failed to generate transcript: ${error.message}`);
     }
-});
 
-function convertAudioToWav(inputPath, outputPath) {
-    return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-        .toFormat('wav')
-        .audioChannels(1)
-        .audioFrequency(16000)
-        .audioCodec('pcm_s16le')
-        .audioBitrate('256k')
-        .audioFilters('loudnorm')
-        .on('start', (commandLine) => {
-        })
-        .on('progress', (progress) => {
-        })
-        .on('end', () => {
-            resolve();
-        })
-        .on('error', (err) => {
-            reject(err);
-        })
-        .save(outputPath);
+    return response.status(200).json({
+        success: true,
+        transcript: transcript,
+        formattedConversation: vertexResult?.parsedResult?.formattedConversation || "",
+        url: vertexResult?.url || "",
+        message: 'Transcript generated successfully',
     });
+
+} catch (error) {
+    console.error('Error generating transcript:', error);
+    return response.status(400).send(`Failed to generate transcript: ${error.message}`);
 }
+});
 
 export async function createGoogleDoc(summaryText) {
     const folderId = '18W-BP-I-O8Wdykwp2tY9vWX5hMdJ1oWO';
@@ -291,7 +209,7 @@ export async function createGoogleDoc(summaryText) {
             "https://www.googleapis.com/auth/drive"
         ],
     });
-    
+
     const docs = google.docs({ version: "v1", auth });
     const drive = google.drive({ version: "v3", auth });
 
@@ -414,3 +332,175 @@ export async function createGoogleDoc(summaryText) {
         throw error;
     }
 }
+
+export const saveCallLogs = onRequest({ cors: true, secrets: ["SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async (request, response) => {
+    getSupabase();
+
+    if (request.method !== "POST") {
+        return response.status(405).send("Method Not Allowed");
+    }
+
+    try {
+        const { Sender, Date, Message, Type } = request.body;
+
+        if (!Sender || !Date) {
+            return response.status(400).json({ success: false, message: "Missing details in request body" });
+        }
+
+        const { data, error } = await supabase
+        .from('communications') 
+        .insert([
+            { 
+            "phone_number": Sender,
+            "date": Date,
+            "message": Message,
+            "Type": Type,
+            }
+        ]);
+
+        if (error) {
+            console.error("Supabase Error:", error);
+            return response.status(400).send(error);
+        }
+
+        response.status(200).send({ success: true });
+    } catch (err) {
+        console.error("System Error:", err);
+        response.status(500).send("Internal Server Error");
+    }
+});
+
+export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCESS_TOKEN", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async (request, response) => {
+    const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN; 
+    getSupabase();  
+
+    if (request.method === "GET") {
+        const mode = request.query["hub.mode"];
+        const token = request.query["hub.verify_token"];
+        const challenge = request.query["hub.challenge"];
+
+        if (mode === "subscribe" && token === WHATSAPP_ACCESS_TOKEN) {
+            console.log("WhatsApp Webhook Verified!");
+            return response.status(200).send(challenge);
+        }
+        return response.sendStatus(403);
+    }
+
+    if (request.method === "POST") {
+        const data = request.body;
+
+        try {
+            if (data.entry && data.entry[0].changes && data.entry[0].changes[0].value.messages) {
+            
+                console.log("Changes:", JSON.stringify(data.entry[0].changes, null, 2));
+
+                const messageObject = data.entry[0].changes[0].value.messages[0];
+                const userMessage = messageObject.text.body;
+                const senderNumber = data.entry[0].changes[0].value.metadata.phone_number_id;
+                const recipientNumber = messageObject.from;
+
+                console.log("recipientNumber (Customer):", recipientNumber);
+                console.log("senderNumber:", senderNumber);
+                console.log("userMessage", userMessage);
+
+                let messageContent = "";
+                const messageType = messageObject.type;
+                if (messageType === "text") {
+                    messageContent = messageObject.text.body;
+                } else {
+                    messageContent = `[${messageType} received]`;
+                }
+
+                const now = new Date();
+                const dateStr = now.toISOString().split('T')[0];
+                const timeStr = now.toTimeString().split(' ')[0];
+
+                console.log(`Saving: ${recipientNumber} | ${dateStr} | ${timeStr}`);
+
+                const { error } = await supabase
+                .from('messages')
+                .insert({
+                    type: "Whatsapp",
+                    phone_number: recipientNumber,
+                    date: dateStr,
+                    time: timeStr,
+                    content: messageContent
+                });
+
+                if (error) {
+                    console.error("Supabase Error:", error);
+                } else {
+                    console.log("Message saved to Supabase successfully.");
+                }
+
+            }
+
+            return response.status(200).send("EVENT_RECEIVED");
+        } catch (error) {
+            console.error("Error saving WhatsApp message:", error);
+            return response.status(200).send("EVENT_RECEIVED");
+        }
+    }
+
+    return response.sendStatus(405);
+});
+
+export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
+
+    const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+    const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
+
+    const { recipientNumber, messageText, type, templateName, templateLanguage } = request.body;
+
+    if (!recipientNumber || !messageText || !type) {
+        return response.status(400).send("Missing required parameters");
+    }
+
+    const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+
+    let payload = { };
+
+    if (type === "text") {
+        payload = {
+            messaging_product: "whatsapp",
+            recipient_type: "individual",
+            to: recipientNumber,
+            type: "text",
+            text: {
+                preview_url: false,
+                body: "Hello! This is a regular text message."
+            }
+        };
+    }
+
+    if (type === "template") {
+        payload = {
+            messaging_product: "whatsapp",
+            to: recipientNumber,
+            type: "template",
+            template: { "name": templateName, "language": { "code": templateLanguage } },
+        };
+    }
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+        });
+        const apiResponse = await res.json();
+
+        console.log("WhatsApp Message Sent:", apiResponse);
+        return response.status(200).send({ success: true, data: apiResponse?.data });
+
+    } catch (error) {
+        console.error("Error sending WhatsApp message:", error.response?.data || error.message);
+        return response.status(500).send({ 
+            success: false, 
+            error: error.response?.data || "Failed to send message" 
+        });
+    }
+});
