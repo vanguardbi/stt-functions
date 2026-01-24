@@ -1,12 +1,12 @@
 import { onRequest } from "firebase-functions/v2/https";
 import { VertexAI } from "@google-cloud/vertexai";
-import mainServiceAccount from "./key2.json" with { type: "json" };
 import { google } from "googleapis";
 import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
 let supabase;
+let mainServiceAccount;
 
 const getSupabase = () => {
     if (!supabase) {
@@ -14,6 +14,12 @@ const getSupabase = () => {
             process.env.SUPABASE_URL,
             process.env.SUPABASE_ANON_KEY
         );
+    }
+};
+
+const getMainServiceAccount = () => {
+    if (!mainServiceAccount) {
+        mainServiceAccount = process.env.SHEETS_SERVICE_ACCOUNT;
     }
 };
 
@@ -134,9 +140,10 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
     }
 }
 
-export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async(request, response) => {
+export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SHEETS_SERVICE_ACCOUNT", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async(request, response) => {
     const VERTEX_CREDENTIALS_JSON = process.env.VERTEX_CREDENTIALS_JSON;
     getSupabase();
+    getMainServiceAccount();
 
     if (request.method !== "POST") {
         return response.status(405).send("Method Not Allowed");
