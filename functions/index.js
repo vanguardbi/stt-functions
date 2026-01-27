@@ -19,11 +19,11 @@ const getSupabase = () => {
 
 const getMainServiceAccount = () => {
     if (!mainServiceAccount) {
-        mainServiceAccount = process.env.SHEETS_SERVICE_ACCOUNT;
+        mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
     }
 };
 
-async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript: rawTranscript, name, tracks, nextSessionPlans }) {
+async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript: rawTranscript, name, tracks, nextSessionPlans, sessionNotes }) {
     try {
         const vertexAI = new VertexAI({
             project: "forestfoods",
@@ -76,7 +76,7 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
         }
         console.log("nextSessionPlans", nextSessionPlans);
 
-        const formattedTemplate = template
+        let formattedTemplate = template
             .replace('{name}', name)
             .replace('{track}', trackName)
             .replace('{today}', today)
@@ -86,6 +86,12 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
                 .split(/[\n,]+/)
                 .map((o, i) => `${'-'} ${o.trim()}`)
                 .join('\n'));;
+
+        if (sessionNotes && sessionNotes.trim() !== "") {
+            const notesSection = `\nSession Notes:\n${sessionNotes}\n`;
+            
+            formattedTemplate = formattedTemplate.replace("Signed:", `${notesSection}\nSigned:`);
+        }
 
         const prompt = `
             You are analyzing a speech therapy session transcript and producing professional clinical documentation.
@@ -141,12 +147,12 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
 }
 
 export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SHEETS_SERVICE_ACCOUNT", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async(request, response) => {
-    const VERTEX_CREDENTIALS_JSON = process.env.VERTEX_CREDENTIALS_JSON;
+    const VERTEX_CREDENTIALS_JSON = JSON.parse(process.env.VERTEX_CREDENTIALS_JSON);
     getSupabase();
     getMainServiceAccount();
 
     if (request.method !== "POST") {
-        return response.status(405).send("Method Not Allowed");
+        return response.status(405).json({ success: false, message: "Method not allowed" });
     }
 
     const authHeader = request.headers.authorization || "";
@@ -168,14 +174,14 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
         .json({ success: false, message: "Not authorized to access this route" });
     }
 
-    const { transcript, sessionId, name, tracks, nextSessionPlans } = request.body;
+    const { transcript, sessionId, name, tracks, nextSessionPlans, sessionNotes } = request.body;
     if (!transcript || !sessionId || !name || !tracks) {
         return response.status(400).json({ success: false, message: "Missing details in request body" });
     }
 
     try {
 
-    const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans });
+    const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans, sessionNotes });
 
     if (sessionId) {
         const { error } = await supabase
@@ -203,7 +209,11 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
 
 } catch (error) {
     console.error('Error generating transcript:', error);
-    return response.status(400).send(`Failed to generate transcript: ${error.message}`);
+    return response.status(400).json({
+        success: false,
+        error: "Error generating transcript",
+        message: `Failed to generate transcript: ${error.message}`
+    });
 }
 });
 
