@@ -4,9 +4,11 @@ import { google } from "googleapis";
 import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import mainServiceAccount from "./key2.json" with { type: "json" };
+import { format, toZonedTime } from "date-fns-tz";
 
 let supabase;
-let mainServiceAccount;
+// let mainServiceAccount;
 
 const getSupabase = () => {
     if (!supabase) {
@@ -19,9 +21,54 @@ const getSupabase = () => {
 
 const getMainServiceAccount = () => {
     if (!mainServiceAccount) {
-        mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
+        // mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
     }
 };
+
+function toSnakeCase(text) {
+    return text
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '_')           // Replace spaces with underscores
+        .replace(/[^a-z0-9_]/g, '');    // Remove non-alphanumeric chars except underscore
+}
+
+// Helper: Parse dd/mm/yyyy to ISO String
+function parseDateToIso(dateStr) {
+    try {
+        if (!dateStr || typeof dateStr !== 'string') return null;
+        const parts = dateStr.split("/");
+        if (parts.length !== 3) return dateStr; // Fallback if not matching format
+        const [day, month, year] = parts.map(Number);
+        // Create UTC date at 00:00:00
+        const date = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+        return date.toISOString();
+    } catch (e) {
+        console.warn(`Failed to parse date: ${dateStr}, e`);
+        return dateStr;
+    }
+}
+
+// Helper: Parse dd/mm/yyyy hh:mm:ss to ISO String
+function parseDateTimeToIso(dateTimeStr) {
+    try {
+        if (!dateTimeStr || typeof dateTimeStr !== 'string') return null;
+        const [datePart, timePart] = dateTimeStr.split(" ");
+        if (!datePart || !timePart) return dateTimeStr; // Fallback
+
+        const [day, month, year] = datePart.split("/").map(Number);
+        const timeComponents = timePart.split(":").map(Number);
+        const hours = timeComponents[0];
+        const minutes = timeComponents[1];
+        const seconds = timeComponents[2] || 0;
+
+        const date = new Date(Date.UTC(year, month - 1, day, hours, minutes, seconds));
+        return date.toISOString();
+    } catch (e) {
+        console.warn(`Failed to parse datetime: ${dateTimeStr}, e`);
+        return dateTimeStr;
+    }
+}
 
 async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript: rawTranscript, name, tracks, nextSessionPlans, sessionNotes }) {
     try {
@@ -29,7 +76,7 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
             project: "forestfoods",
             location: 'us-central1',
             googleAuthOptions: {
-                credentials: VERTEX_CREDENTIALS_JSON,
+                keyFilename: "./sac2.json",
                 scopes: ['https://www.googleapis.com/auth/cloud-platform'],
             },
         });
@@ -190,6 +237,7 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
                 formatted_conversation: vertexResult?.parsedResult?.formattedConversation || "",
                 summary: vertexResult?.parsedResult?.summary || "",
                 doc_url: vertexResult?.url || "",
+                generating_report: false,
             })
             .eq('id', sessionId);
 
@@ -207,14 +255,41 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
         message: 'Transcript generated successfully',
     });
 
-} catch (error) {
-    console.error('Error generating transcript:', error);
-    return response.status(400).json({
-        success: false,
-        error: "Error generating transcript",
-        message: `Failed to generate transcript: ${error.message}`
-    });
-}
+    } catch (error) {
+        console.error('Error generating transcript:', error);
+        if (sessionId) {
+            let errorMessage = "Unknown error";
+                
+            if (error instanceof Error) {
+                // If it's a standard Error object (like new Error('...'))
+                errorMessage = error?.message; 
+            } else if (typeof error === 'object') {
+                try {
+                    errorMessage = JSON.stringify(error);
+                } catch (e) {
+                    errorMessage = "Unserializable object error";
+                }
+            } else {
+                errorMessage = String(error);
+            }
+
+            try {
+                await supabase.from('sessions').update({
+                        generating_report: false,
+                        generating_report_error: true,
+                        report_error_message: errorMessage,
+                    })
+                    .eq('id', sessionId);
+            } catch (dbUpdateError) {
+                console.error("Failed to update error status in Supabase:", dbUpdateError);
+            }
+        }
+        return response.status(400).json({
+            success: false,
+            error: "Error generating transcript",
+            message: `Failed to generate transcript: ${error.message}`
+        });
+    }
 });
 
 export async function createGoogleDoc(summaryText) {
@@ -387,9 +462,11 @@ export const saveCallLogs = onRequest({ cors: true, secrets: ["SUPABASE_URL", "S
     }
 });
 
-export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCESS_TOKEN", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async (request, response) => {
+export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCESS_TOKEN", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN; 
-    getSupabase();  
+    const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
+    const APPSHEET_ACCESS_KEY = process.env.APPSHEET_ACCESS_KEY;
+    const TABLE_NAME = "WhatsApp";
 
     if (request.method === "GET") {
         const mode = request.query["hub.mode"];
@@ -429,26 +506,57 @@ export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCES
                 }
 
                 const now = new Date();
-                const dateStr = now.toISOString().split('T')[0];
-                const timeStr = now.toTimeString().split(' ')[0];
+                const timeZone = 'Africa/Nairobi';
+                const nairobiDate = toZonedTime(now, timeZone);
+                const dateStr = format(nairobiDate, 'yyyy-MM-dd', { timeZone });
+                const timeStr = format(nairobiDate, 'HH:mm:ss', { timeZone });
 
                 console.log(`Saving: ${recipientNumber} | ${dateStr} | ${timeStr}`);
 
-                const { error } = await supabase
-                .from('messages')
-                .insert({
-                    type: "Whatsapp",
-                    phone_number: recipientNumber,
-                    date: dateStr,
-                    time: timeStr,
-                    content: messageContent
+                const apiUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(TABLE_NAME)}/Action`;
+
+                const appsheetResponse = await fetch(apiUrl, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "applicationAccessKey": APPSHEET_ACCESS_KEY
+                    },
+                    body: JSON.stringify({
+                        Action: "Add",
+                        Properties: {
+                            Locale: "en-US",
+                            Timezone: "E. Africa Standard Time"
+                        },
+                        Rows: [{
+                            "type": "text",
+                            "phone_number": recipientNumber,
+                            "date": dateStr,
+                            "time": timeStr,
+                            "content": messageContent,
+                        }]
+                    })
                 });
 
-                if (error) {
-                    console.error("Supabase Error:", error);
-                } else {
-                    console.log("Message saved to Supabase successfully.");
+                if (!appsheetResponse.ok) {
+                    const errorText = await appsheetResponse.text();
+                    console.log(`AppSheet API Error: ${errorText}`);
                 }
+                const responseText = await appsheetResponse.text();
+                console.log("Raw Response Status:", appsheetResponse.status);
+                console.log("Raw Response Body:", responseText);
+
+                if (responseText) {
+                    try {
+                        const result = JSON.parse(responseText);
+                        console.log("Parsed Result:", JSON.stringify(result, null, 2));
+                    } catch (e) {
+                        console.error("Failed to parse JSON. Raw body was:", responseText);
+                    }
+                } else {
+                    console.warn("AppSheet returned an completely empty body.");
+                }
+
+                console.log("Message saved to AppSheet successfully.");
 
             }
 
@@ -469,8 +577,11 @@ export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_P
 
     const { recipientNumber, messageText, type, templateName, templateLanguage } = request.body;
 
-    if (!recipientNumber || !messageText || !type) {
-        return response.status(400).send("Missing required parameters");
+    if (!recipientNumber || !type) {
+        return response.status(400).json({
+            success: false,
+            error: "Missing required parameters"
+        });
     }
 
     const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
@@ -485,7 +596,7 @@ export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_P
             type: "text",
             text: {
                 preview_url: false,
-                body: "Hello! This is a regular text message."
+                body: messageText
             }
         };
     }
@@ -519,5 +630,129 @@ export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_P
             success: false, 
             error: error.response?.data || "Failed to send message" 
         });
+    }
+});
+
+export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async (request, response) => {
+    getSupabase();
+
+    if (request.method !== "POST") {
+        return response.status(405).json({ success: false, message: "Method Not Allowed" });
+    }
+
+    try {
+        const { UpdateMode, TableName, Data } = request.body;
+
+        if (!UpdateMode || !TableName || !Data || !Data.ID) {
+            console.log("Missing required fields: UpdateMode, TableName, or Data with ID");
+            response.status(400).json({ success: false, message: "Missing required fields: UpdateMode, TableName, and Data with ID are required." });
+            return;
+        }
+
+        let collectionName = toSnakeCase(TableName);
+
+        // Handle table name mapping (AppSheet 'WhatsApp' -> Supabase 'messages')
+        if (TableName === 'WhatsApp' || collectionName === 'whatsapp') {
+            collectionName = 'messages';
+        }
+
+        console.log(`Target Table: ${collectionName}`);
+
+        const documentId = Data.ID;
+
+        // Process fields in Data
+        const processedData = {};
+        for (const [key, value] of Object.entries(Data)) {
+            // Convert key to snake_case for column mapping
+            const snakeKey = key;
+
+            if (value === null || value === undefined) {
+                processedData[snakeKey] = null;
+                continue;
+            }
+
+            const keyLower = key.toLowerCase();
+
+            // Number parsing for 'Volume'
+            if (keyLower.includes("volume") && typeof value === 'string') {
+                const numValue = parseFloat(value);
+                processedData[snakeKey] = isNaN(numValue) ? 0 : numValue;
+            }
+            // Timestamp parsing
+            else if (keyLower.includes("timestamp") && typeof value === 'string') {
+                // Check for dd/mm/yyyy hh:mm:ss format
+                if (value.includes("/") && value.includes(":")) {
+                    processedData[snakeKey] = parseDateTimeToIso(value);
+                } else {
+                    // Fallback to standard Date parse if it's already ISO or other format
+                    const date = new Date(value);
+                    processedData[snakeKey] = !isNaN(date.getTime()) ? date.toISOString() : value;
+                }
+            }
+            // Date parsing (avoid double-parsing if it contains timestamp)
+            else if (keyLower.includes("date") && typeof value === 'string' && !keyLower.includes("timestamp")) {
+                // Check for dd/mm/yyyy format
+                if (value.includes("/")) {
+                    processedData[snakeKey] = parseDateToIso(value);
+                } else {
+                    const date = new Date(value);
+                    processedData[snakeKey] = !isNaN(date.getTime()) ? date.toISOString() : value;
+                }
+            }
+            else {
+                // Leave strings, numbers, booleans as is
+                processedData[snakeKey] = value;
+            }
+        }
+
+        if ('ID' in processedData) {
+            processedData.id = processedData.ID;
+            delete processedData.ID;
+        }
+
+        const updateModeLower = UpdateMode.toLowerCase();
+        let resultMessage = "";
+
+        // AppSheet 'Add' or 'Update'
+        if (updateModeLower === "add" || updateModeLower === "update") {
+            // Upsert handles both insert and update based on Primary Key.
+            // We assume the Supabase table columns match the AppSheet keys (or are handled by Supabase's quoting).
+            const { error } = await supabase
+                .from(collectionName)
+                .upsert(processedData);
+
+            if (error) {
+                console.error(`Error upserting to ${collectionName}:, error`);
+                throw error;
+            }
+            
+            resultMessage = `Document ${updateModeLower}d successfully in ${collectionName} with ID: ${documentId}`;
+
+        } else if (updateModeLower === "delete") {
+            
+            const { error } = await supabase
+                .from(collectionName)
+                .delete()
+                .eq('id', documentId); // Assumption: PK column is 'id' (snake_case)
+
+            if (error) {
+                console.error(`Error deleting from ${collectionName}:, error`);
+                throw error;
+            }
+            resultMessage = `Document deleted successfully from ${collectionName} with ID: ${documentId}`;
+
+        } else {
+            return new Response("Invalid UpdateMode. Use 'Add', 'Update', or 'Delete'.", {
+                status: 400,
+                headers: corsHeaders
+            });
+        }
+
+        console.log(resultMessage);
+
+        response.status(200).json({ success: true });
+    } catch (err) {
+        console.error("System Error:", err);
+        response.status(500).json({ success: false, message: "Internal Server Error" });
     }
 });
