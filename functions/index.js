@@ -4,11 +4,10 @@ import { google } from "googleapis";
 import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import mainServiceAccount from "./key2.json" with { type: "json" };
 import { format, toZonedTime } from "date-fns-tz";
 
 let supabase;
-// let mainServiceAccount;
+let mainServiceAccount;
 
 const getSupabase = () => {
     if (!supabase) {
@@ -21,7 +20,7 @@ const getSupabase = () => {
 
 const getMainServiceAccount = () => {
     if (!mainServiceAccount) {
-        // mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
+        mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
     }
 };
 
@@ -76,7 +75,8 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
             project: "forestfoods",
             location: 'us-central1',
             googleAuthOptions: {
-                keyFilename: "./sac2.json",
+                // keyFilename: "./sac2.json",
+                credentials: VERTEX_CREDENTIALS_JSON,
                 scopes: ['https://www.googleapis.com/auth/cloud-platform'],
             },
         });
