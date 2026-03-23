@@ -5,6 +5,14 @@ import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { format, toZonedTime } from "date-fns-tz";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import { Storage } from "@google-cloud/storage";
+import admin from "firebase-admin";
+import { createClient } from "@deepgram/sdk";
+import fs from "fs";
+import path from "path";
+import os from "os";
 
 let supabase;
 let mainServiceAccount;
@@ -21,6 +29,22 @@ const getSupabase = () => {
 const getMainServiceAccount = () => {
     if (!mainServiceAccount) {
         mainServiceAccount = JSON.parse(process.env.SHEETS_SERVICE_ACCOUNT);
+    }
+};
+
+const initializeFirebaseAdmin = () => {
+    if (admin.apps.length === 0) {
+        try {
+            const serviceAccount = JSON.parse(process.env.MAIN_SERVICE_ACCOUNT);
+            
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount),
+                storageBucket: "stt-notes-474506.firebasestorage.app",
+            });
+        } catch (error) {
+            console.error("Failed to initialize Firebase Admin:", error);
+            throw new Error("Internal Server Error: Initialization Failed");
+        }
     }
 };
 
@@ -193,10 +217,11 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
     }
 }
 
-export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SHEETS_SERVICE_ACCOUNT", "SUPABASE_URL", "SUPABASE_ANON_KEY"] }, async(request, response) => {
+export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB', secrets: ["VERTEX_CREDENTIALS_JSON", "SHEETS_SERVICE_ACCOUNT", "SUPABASE_URL", "SUPABASE_ANON_KEY", "DEEPGRAM_API_KEY", "MAIN_SERVICE_ACCOUNT"] }, async(request, response) => {
     const VERTEX_CREDENTIALS_JSON = JSON.parse(process.env.VERTEX_CREDENTIALS_JSON);
     getSupabase();
     getMainServiceAccount();
+    initializeFirebaseAdmin();
 
     if (request.method !== "POST") {
         return response.status(405).json({ success: false, message: "Method not allowed" });
@@ -206,9 +231,7 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
 
     const match = authHeader.match(/^Bearer (.*)$/);
     if (!match) {
-        return response
-        .status(401)
-        .json({ success: false, message: "Not authorized to access this route" });
+        return response.status(401).json({ success: false, message: "Not authorized to access this route" });
     }
 
     const accessToken = match[1];
@@ -216,44 +239,60 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
     const { data: { user }, error } = await supabase.auth.getUser(accessToken);
 
     if (error || !user) {
-    return response
-        .status(403)
-        .json({ success: false, message: "Not authorized to access this route" });
+        return response.status(403).json({ success: false, message: "Not authorized to access this route" });
     }
 
-    const { transcript, sessionId, name, tracks, nextSessionPlans, sessionNotes } = request.body;
-    if (!transcript || !sessionId || !name || !tracks) {
+    const { audioUrl, sessionId, name, tracks, nextSessionPlans, sessionNotes } = request.body;
+    if (!audioUrl || !sessionId || !name || !tracks) {
         return response.status(400).json({ success: false, message: "Missing details in request body" });
     }
 
     try {
+        const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-    const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans, sessionNotes });
+        const { result, error } = await deepgram.listen.prerecorded.transcribeUrl(
+            { url: audioUrl },
+            {
+                model: "nova-2",
+                smart_format: true,
+                utterances: true,
+                punctuation: true,
+                // diarize: true,
+            }
+        );
 
-    if (sessionId) {
-        const { error } = await supabase
-            .from('sessions')
-            .update({
-                formatted_conversation: vertexResult?.parsedResult?.formattedConversation || "",
-                summary: vertexResult?.parsedResult?.summary || "",
-                doc_url: vertexResult?.url || "",
-                generating_report: false,
-            })
-            .eq('id', sessionId);
+        if (error) throw error;
 
-        if (error) {
-            console.error("Supabase Write Error:", error);
-            throw new Error(error.message);
+        const transcript = result.results.channels[0].alternatives[0].transcript;
+        console.log("Deepgram transcription complete.", transcript);
+
+        const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans, sessionNotes });
+
+        if (sessionId) {
+            const { error } = await supabase
+                .from('sessions')
+                .update({
+                    formatted_conversation: vertexResult?.parsedResult?.formattedConversation || "",
+                    summary: vertexResult?.parsedResult?.summary || "",
+                    doc_url: vertexResult?.url || "",
+                    generating_report: false,
+                    transcript,
+                })
+                .eq('id', sessionId);
+
+            if (error) {
+                console.error("Supabase Write Error:", error);
+                throw new Error(error.message);
+            }
         }
-    }
 
-    return response.status(200).json({
-        success: true,
-        transcript: transcript,
-        formattedConversation: vertexResult?.parsedResult?.formattedConversation || "",
-        url: vertexResult?.url || "",
-        message: 'Transcript generated successfully',
-    });
+        return response.status(200).json({
+            success: true,
+            transcript: transcript,
+            formattedConversation: vertexResult?.parsedResult?.formattedConversation || "",
+            url: vertexResult?.url || "",
+            message: 'Transcript generated successfully',
+        });
 
     } catch (error) {
         console.error('Error generating transcript:', error);
