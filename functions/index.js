@@ -5,17 +5,20 @@ import dayjs from "dayjs";
 import { TrackTemplates } from "./utils.js";
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { format, toZonedTime } from "date-fns-tz";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-import { Storage } from "@google-cloud/storage";
 import admin from "firebase-admin";
 import { createClient } from "@deepgram/sdk";
-import fs from "fs";
-import path from "path";
-import os from "os";
+import crypto from "crypto";
+import axios from "axios";
+import { logger } from "firebase-functions";
 
 let supabase;
 let mainServiceAccount;
+let PAYSTACK_SECRET_LIVE;
+let PAYSTACK_SECRET_TEST;
+let FG_API_KEY;
+const FG_LOCATION_ID = "OKJqY9yaFkMNhLMlyE1V";
+const GHL_BASE = "https://rest.gohighlevel.com/v1";
+const TAGS = ["stt", "stt-pointing-leading"];
 
 const getSupabase = () => {
     if (!supabase) {
@@ -24,6 +27,12 @@ const getSupabase = () => {
             process.env.SUPABASE_ANON_KEY
         );
     }
+};
+
+const getPaystackEnv = () => {
+    PAYSTACK_SECRET_LIVE = process.env.PAYSTACK_SECRET_LIVE;
+    PAYSTACK_SECRET_TEST = process.env.PAYSTACK_SECRET_TEST;
+    FG_API_KEY = process.env.FG_API_KEY;
 };
 
 const getMainServiceAccount = () => {
@@ -793,5 +802,263 @@ export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", 
     } catch (err) {
         console.error("System Error:", err);
         response.status(500).json({ success: false, message: "Internal Server Error" });
+    }
+});
+
+export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY"] }, async (request, response) => {
+
+    const { amount, sessionId, phone } = request.query;
+
+    try {
+
+        const paystackResponse = await fetch("https://api.paystack.co/transaction/initialize", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                email: phone,
+                amount: amount * 100, // KES cents
+                currency: "KES",
+                reference: sessionId, // This links the payment to your AppSheet Row
+                channels: ["mobile_money"],
+                // callback_url: "https://website.com/thank-you" // Where user goes after paying
+            }),
+        });
+
+        const data = await paystackResponse.json();
+
+        if (!data.status) {
+            throw new Error(data.message || "Paystack initialization failed");
+        }
+        response.redirect(data.data.authorization_url);
+
+    } catch (err) {
+        console.error("Payment Initialization Error:", err);
+        response.status(500).send("Could not start payment. Please try again.");
+    }
+});
+
+function verifySignature(rawBody, signature) {
+  for (const secret of [PAYSTACK_SECRET_LIVE, PAYSTACK_SECRET_TEST]) {
+    if (!secret) continue;
+    const hash = crypto
+      .createHmac("sha512", secret)
+      .update(rawBody)
+      .digest("hex");
+    if (hash === signature) return true;
+  }
+  return false;
+}
+
+const ghlHeaders = () => ({
+  Authorization: `Bearer ${FG_API_KEY}`,
+  "Content-Type": "application/json",
+});
+
+async function findContactByEmail(email) {
+  try {
+    const res = await axios.get(
+      `${GHL_BASE}/contacts/lookup?email=${encodeURIComponent(email)}`,
+      { headers: ghlHeaders() }
+    );
+    return res.data.contact || null;
+  } catch (err) {
+    if (err.response?.status === 404) return null;
+    throw err;
+  }
+}
+
+async function createContact({ email, name, phone }) {
+  const res = await axios.post(
+    `${GHL_BASE}/contacts/`,
+    {
+      locationId: FG_LOCATION_ID,
+      email,
+      name,
+      phone,
+      tags: TAGS,
+    },
+    { headers: ghlHeaders() }
+  );
+  return res.data.contact;
+}
+
+async function updateContact(contactId, existingTags, { name, phone }) {
+  const mergedTags = [...new Set([...existingTags, ...TAGS])];
+  await axios.put(
+    `${GHL_BASE}/contacts/${contactId}`,
+    { name, phone, tags: mergedTags },
+    { headers: ghlHeaders() }
+  );
+}
+
+async function upsertContact({ email, name, phone }) {
+  const existing = await findContactByEmail(email);
+
+  if (existing) {
+    await updateContact(existing.id, existing.tags || [], { name, phone });
+    logger.info("FG Funnels: updated existing contact", {
+      email,
+      id: existing.id,
+    });
+  } else {
+    const contact = await createContact({ email, name, phone });
+    logger.info("FG Funnels: created new contact", {
+      email,
+      id: contact?.id,
+    });
+  }
+}
+
+export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_LIVE", "PAYSTACK_SECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
+    getPaystackEnv();
+
+    const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
+    const APPSHEET_ACCESS_KEY = process.env.APPSHEET_ACCESS_KEY;
+    const SECRET = process.env.PAYSTACK_SECRET_KEY;
+
+    const signature = request.headers["x-paystack-signature"];
+    if (!signature || !verifySignature(request.rawBody, signature)) {
+        logger.warn("paystackWebhook: invalid signature — request rejected");
+        return response.status(401).send("Unauthorized");
+    }
+
+    const { event, data } = request.body;
+    logger.info(`paystackWebhook: received event "${event}"`);
+
+    if (event !== "charge.success") {
+        console.log("not a successful charge", event);
+        return response.status(200).json({ message: "Event ignored" });
+    }
+
+    const { customer, amount, currency, reference } = data;
+
+    if (customer?.first_name || currency) {
+        // Handle Course Paystack Callback
+        
+        const email = customer.email;
+        const name = [customer.first_name, customer.last_name].filter(Boolean).join(" ") || email;
+        const phone = customer.phone || "";
+
+        logger.info("paystackWebhook: successful payment", {
+            email,
+            name,
+            phone,
+            reference,
+            amount,
+            currency,
+        });
+
+        try {
+            await upsertContact({ email, name, phone });
+        } catch (err) {
+            // Log but still return 200 so Paystack does not retry
+            logger.error("paystackWebhook: FG Funnels upsert failed", {
+                error: err.message,
+                email,
+            });
+        }
+
+    } else {
+        const sessionId = event.data.reference; // This matches AppSheet Key Column
+        // const amount = event.data.amount / 100;
+
+        try {
+            const tableName = "Sessions";
+            
+            const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
+
+            const response = await fetch(appsheetUrl, {
+                method: "POST",
+                headers: {
+                    "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    "Action": "Edit",
+                    "Properties": {
+                        "Locale": "en-US",
+                        "Timezone": "E. Africa Standard Time"
+                    },
+                    "Rows": [
+                        {
+                            "id": sessionId,
+                            "deposit_paid": "Yes",
+                            // "Amount_Paid": amount,
+                        }
+                    ]
+                })
+            });
+
+            const result = await response.json();
+            console.log("AppSheet Update Result:", result);
+
+        } catch (error) {
+            console.error("AppSheet API Error:", error);
+        }
+        
+    }    
+
+    response.status(200).json({
+        success: true,
+        message: "Event processed"
+    });
+});
+
+export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
+    const { to, amount, sessionId, phone } = request.body;
+    const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+    const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
+
+    const urlParams = `amount=${amount}&sessionId=${sessionId}&phone=${phone}`;
+
+    const whatsappPayload = {
+        messaging_product: "whatsapp",
+        to: to, // Format: 254712345678
+        type: "template",
+        template: {
+            name: "payment_link_mpesa",
+            language: { code: "en_US" },
+            components: [
+                {
+                    type: "button",
+                    sub_type: "url",
+                    index: "0",
+                    parameters: [
+                        {
+                            type: "text",
+                            text: urlParams // This fills the {{1}} in your Meta Template URL
+                        }
+                    ]
+                }
+            ]
+        }
+    };
+
+    try {
+        const res = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(whatsappPayload)
+        });
+
+        const result = await res.json();
+        response.status(200).json({
+            success: true,
+            message: "Message Sent!",
+            result
+        });
+    } catch (error) {
+        console.error("Send WhatsApp Payment Error:", error);
+        response.status(400).json({
+            success: false,
+            message: "Failed to send WhatsApp Message",
+            error
+        });
     }
 });
