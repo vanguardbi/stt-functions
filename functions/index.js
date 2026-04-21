@@ -30,9 +30,9 @@ const getSupabase = () => {
 };
 
 const getPaystackEnv = () => {
-    PAYSTACK_SECRET_LIVE = process.env.PAYSTACK_SECRET_LIVE;
-    PAYSTACK_SECRET_TEST = process.env.PAYSTACK_SECRET_TEST;
-    FG_API_KEY = process.env.FG_API_KEY;
+    PAYSTACK_SECRET_LIVE = process.env.PAYSTACKSECRET_LIVE;
+    PAYSTACK_SECRET_TEST = process.env.PAYSTACKSECRET_TEST;
+    FG_API_KEY = process.env.FGAPI_KEY;
 };
 
 const getMainServiceAccount = () => {
@@ -530,8 +530,21 @@ export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCES
 
     if (request.method === "POST") {
         const data = request.body;
+        console.log("Full Webhook Body:", JSON.stringify(data, null, 2));
 
         try {
+            if (data.entry?.[0].changes?.[0].value.statuses) {
+                const status = data.entry[0].changes[0].value.statuses[0];
+                if (status.status === "failed") {
+                    console.error("MESSAGE FAILED!");
+                    console.error("Error Code:", status.errors[0].code);
+                    console.error("Error Message:", status.errors[0].title);
+                    console.error("Error Details:", status.errors[0].details);
+                } else {
+                    console.log(`Message status update: ${status.status} for recipient: ${status.recipient_id}`);
+                }
+            }
+
             if (data.entry && data.entry[0].changes && data.entry[0].changes[0].value.messages) {
             
                 console.log("Changes:", JSON.stringify(data.entry[0].changes, null, 2));
@@ -976,7 +989,7 @@ async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, refe
     }
 }
 
-export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_LIVE", "FG_API_KEY", "PAYSTACK_SECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
+export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET_LIVE", "FGAPI_KEY", "PAYSTACKSECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
     getPaystackEnv();
 
     const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
@@ -991,6 +1004,7 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRE
 
     const { event, data } = request.body;
     logger.info(`paystackWebhook: received event "${event}"`);
+    console.log("pastackwebhook data: ", data);
 
     if (event !== "charge.success") {
         console.log("not a successful charge", event);
@@ -1018,15 +1032,15 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
 
-    const urlParams = `amount=${amount}&sessionId=${sessionId}&phone=${phone}`;
+    const urlParams = `amount=${amount}&sessionId=${sessionId}&phone=${to}`;
 
     const whatsappPayload = {
         messaging_product: "whatsapp",
         to: to, // Format: 254712345678
         type: "template",
         template: {
-            name: "payment_link_mpesa",
-            language: { code: "en_US" },
+            name: "payment",
+            language: { code: "en" },
             components: [
                 {
                     type: "button",
