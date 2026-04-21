@@ -912,7 +912,71 @@ async function upsertContact({ email, name, phone }) {
   }
 }
 
-export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_LIVE", "PAYSTACK_SECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
+async function handleGHLContactUpsert({ customer, reference, amount, currency }) {
+    const email = customer.email;
+    const name = [customer.first_name, customer.last_name].filter(Boolean).join(" ") || email;
+    const phone = customer.phone || "";
+
+    logger.info("paystackWebhook: successful payment", {
+        email,
+        name,
+        phone,
+        reference,
+        amount,
+        currency,
+    });
+
+    try {
+        await upsertContact({ email, name, phone });
+    } catch (err) {
+        // Log but still return 200 so Paystack does not retry
+        logger.error("paystackWebhook: FG Funnels upsert failed", {
+            error: err.message,
+            email,
+        });
+    }
+}
+
+async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference }) {
+    const sessionId = reference; // This matches AppSheet Key Column
+    // const amount = event.data.amount / 100;
+
+    try {
+        const tableName = "Sessions";
+        
+        const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
+
+        const response = await fetch(appsheetUrl, {
+            method: "POST",
+            headers: {
+                "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                "Action": "Edit",
+                "Properties": {
+                    "Locale": "en-US",
+                    "Timezone": "E. Africa Standard Time"
+                },
+                "Rows": [
+                    {
+                        "id": sessionId,
+                        "deposit_paid": "Yes",
+                        // "Amount_Paid": amount,
+                    }
+                ]
+            })
+        });
+
+        const result = await response.json();
+        console.log("AppSheet Update Result:", result);
+
+    } catch (error) {
+        console.error("AppSheet API Error:", error);
+    }
+}
+
+export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_LIVE", "FG_API_KEY", "PAYSTACK_SECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
     getPaystackEnv();
 
     const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
@@ -935,70 +999,12 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRE
 
     const { customer, amount, currency, reference } = data;
 
-    if (customer?.first_name || currency) {
+    if (customer?.first_name || customer?.last_name) {
         // Handle Course Paystack Callback
-        
-        const email = customer.email;
-        const name = [customer.first_name, customer.last_name].filter(Boolean).join(" ") || email;
-        const phone = customer.phone || "";
-
-        logger.info("paystackWebhook: successful payment", {
-            email,
-            name,
-            phone,
-            reference,
-            amount,
-            currency,
-        });
-
-        try {
-            await upsertContact({ email, name, phone });
-        } catch (err) {
-            // Log but still return 200 so Paystack does not retry
-            logger.error("paystackWebhook: FG Funnels upsert failed", {
-                error: err.message,
-                email,
-            });
-        }
-
+        await handleGHLContactUpsert({ customer, reference, amount, currency });
     } else {
-        const sessionId = event.data.reference; // This matches AppSheet Key Column
-        // const amount = event.data.amount / 100;
-
-        try {
-            const tableName = "Sessions";
-            
-            const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
-
-            const response = await fetch(appsheetUrl, {
-                method: "POST",
-                headers: {
-                    "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    "Action": "Edit",
-                    "Properties": {
-                        "Locale": "en-US",
-                        "Timezone": "E. Africa Standard Time"
-                    },
-                    "Rows": [
-                        {
-                            "id": sessionId,
-                            "deposit_paid": "Yes",
-                            // "Amount_Paid": amount,
-                        }
-                    ]
-                })
-            });
-
-            const result = await response.json();
-            console.log("AppSheet Update Result:", result);
-
-        } catch (error) {
-            console.error("AppSheet API Error:", error);
-        }
-        
+        const sessionId = data.reference;
+        await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: sessionId });
     }    
 
     response.status(200).json({
