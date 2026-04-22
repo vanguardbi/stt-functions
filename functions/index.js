@@ -818,11 +818,13 @@ export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", 
     }
 });
 
-export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY"] }, async (request, response) => {
+export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET_TEST"] }, async (request, response) => {
 
-    const { amount, sessionId, phone } = request.query;
+    const { amount, sessionId, clientId } = request.query;
 
     try {
+        const uniqueReference = `${sessionId}_${Date.now()}`;
+        const email = `${clientId}@speechtherapytotos.com`;
 
         const paystackResponse = await fetch("https://api.paystack.co/transaction/initialize", {
             method: "POST",
@@ -831,11 +833,22 @@ export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_K
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
-                email: phone,
+                email: email,
                 amount: amount * 100, // KES cents
                 currency: "KES",
-                reference: sessionId, // This links the payment to your AppSheet Row
+                reference: uniqueReference,
                 channels: ["mobile_money"],
+                metadata: {
+                    sessionId: sessionId,
+                    clientId: clientId,
+                    custom_fields: [
+                        {
+                            display_name: "Session ID",
+                            variable_name: "session_id",
+                            value: sessionId
+                        }
+                    ]
+                }
                 // callback_url: "https://website.com/thank-you" // Where user goes after paying
             }),
         });
@@ -950,9 +963,9 @@ async function handleGHLContactUpsert({ customer, reference, amount, currency })
     }
 }
 
-async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference }) {
-    const sessionId = reference; // This matches AppSheet Key Column
-    // const amount = event.data.amount / 100;
+async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference, amount }) {
+    const sessionId = reference;
+    const deposit_amount = amount / 100;
 
     try {
         const tableName = "Sessions";
@@ -975,7 +988,7 @@ async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, refe
                     {
                         "id": sessionId,
                         "deposit_paid": "Yes",
-                        // "Amount_Paid": amount,
+                        "deposit_amount": deposit_amount,
                     }
                 ]
             })
@@ -1011,15 +1024,14 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
         return response.status(200).json({ message: "Event ignored" });
     }
 
-    const { customer, amount, currency, reference } = data;
+    const { customer, amount, currency, reference, metadata } = data;
 
-    if (customer?.first_name || customer?.last_name) {
-        // Handle Course Paystack Callback
-        await handleGHLContactUpsert({ customer, reference, amount, currency });
+    if (metadata && metadata.sessionId) {
+        logger.info(`Processing AppSheet update for Session: ${metadata.sessionId}`);
+        await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: metadata.sessionId, amount });
     } else {
-        const sessionId = data.reference;
-        await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: sessionId });
-    }    
+        await handleGHLContactUpsert({ customer, reference, amount, currency });
+    }
 
     response.status(200).json({
         success: true,
@@ -1028,18 +1040,19 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
 });
 
 export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
-    const { to, amount, sessionId, phone } = request.body;
+    const { to, sessionId, type, clientId } = request.body;
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
+    const amount = type === "Gertrudes" ? 2000 : 1000;
 
-    const urlParams = `amount=${amount}&sessionId=${sessionId}&phone=${to}`;
+    const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}`;
 
     const whatsappPayload = {
         messaging_product: "whatsapp",
         to: to, // Format: 254712345678
         type: "template",
         template: {
-            name: "payment",
+            name: "paymentrequest",
             language: { code: "en" },
             components: [
                 {
