@@ -30,9 +30,9 @@ const getSupabase = () => {
 };
 
 const getPaystackEnv = () => {
-    PAYSTACK_SECRET_LIVE = process.env.PAYSTACK_SECRET_LIVE;
-    PAYSTACK_SECRET_TEST = process.env.PAYSTACK_SECRET_TEST;
-    FG_API_KEY = process.env.FG_API_KEY;
+    PAYSTACK_SECRET_LIVE = process.env.PAYSTACKSECRET_LIVE;
+    PAYSTACK_SECRET_TEST = process.env.PAYSTACKSECRET_TEST;
+    FG_API_KEY = process.env.FGAPI_KEY;
 };
 
 const getMainServiceAccount = () => {
@@ -530,8 +530,21 @@ export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCES
 
     if (request.method === "POST") {
         const data = request.body;
+        console.log("Full Webhook Body:", JSON.stringify(data, null, 2));
 
         try {
+            if (data.entry?.[0].changes?.[0].value.statuses) {
+                const status = data.entry[0].changes[0].value.statuses[0];
+                if (status.status === "failed") {
+                    console.error("MESSAGE FAILED!");
+                    console.error("Error Code:", status.errors[0].code);
+                    console.error("Error Message:", status.errors[0].title);
+                    console.error("Error Details:", status.errors[0].details);
+                } else {
+                    console.log(`Message status update: ${status.status} for recipient: ${status.recipient_id}`);
+                }
+            }
+
             if (data.entry && data.entry[0].changes && data.entry[0].changes[0].value.messages) {
             
                 console.log("Changes:", JSON.stringify(data.entry[0].changes, null, 2));
@@ -805,11 +818,13 @@ export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", 
     }
 });
 
-export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY"] }, async (request, response) => {
+export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET_TEST"] }, async (request, response) => {
 
-    const { amount, sessionId, phone } = request.query;
+    const { amount, sessionId, clientId } = request.query;
 
     try {
+        const uniqueReference = `${sessionId}_${Date.now()}`;
+        const email = `${clientId}@speechtherapytotos.com`;
 
         const paystackResponse = await fetch("https://api.paystack.co/transaction/initialize", {
             method: "POST",
@@ -818,11 +833,22 @@ export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_K
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
-                email: phone,
+                email: email,
                 amount: amount * 100, // KES cents
                 currency: "KES",
-                reference: sessionId, // This links the payment to your AppSheet Row
+                reference: uniqueReference,
                 channels: ["mobile_money"],
+                metadata: {
+                    sessionId: sessionId,
+                    clientId: clientId,
+                    custom_fields: [
+                        {
+                            display_name: "Session ID",
+                            variable_name: "session_id",
+                            value: sessionId
+                        }
+                    ]
+                }
                 // callback_url: "https://website.com/thank-you" // Where user goes after paying
             }),
         });
@@ -912,7 +938,71 @@ async function upsertContact({ email, name, phone }) {
   }
 }
 
-export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_LIVE", "PAYSTACK_SECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
+async function handleGHLContactUpsert({ customer, reference, amount, currency }) {
+    const email = customer.email;
+    const name = [customer.first_name, customer.last_name].filter(Boolean).join(" ") || email;
+    const phone = customer.phone || "";
+
+    logger.info("paystackWebhook: successful payment", {
+        email,
+        name,
+        phone,
+        reference,
+        amount,
+        currency,
+    });
+
+    try {
+        await upsertContact({ email, name, phone });
+    } catch (err) {
+        // Log but still return 200 so Paystack does not retry
+        logger.error("paystackWebhook: FG Funnels upsert failed", {
+            error: err.message,
+            email,
+        });
+    }
+}
+
+async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference, amount }) {
+    const sessionId = reference;
+    const deposit_amount = amount / 100;
+
+    try {
+        const tableName = "Sessions";
+        
+        const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
+
+        const response = await fetch(appsheetUrl, {
+            method: "POST",
+            headers: {
+                "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                "Action": "Edit",
+                "Properties": {
+                    "Locale": "en-US",
+                    "Timezone": "E. Africa Standard Time"
+                },
+                "Rows": [
+                    {
+                        "id": sessionId,
+                        "deposit_paid": "Yes",
+                        "deposit_amount": deposit_amount,
+                    }
+                ]
+            })
+        });
+
+        const result = await response.json();
+        console.log("AppSheet Update Result:", result);
+
+    } catch (error) {
+        console.error("AppSheet API Error:", error);
+    }
+}
+
+export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET_LIVE", "FGAPI_KEY", "PAYSTACKSECRET_TEST", "PAYSTACK_SECRET_KEY", "APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY"] }, async (request, response) => {
     getPaystackEnv();
 
     const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
@@ -927,79 +1017,21 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRE
 
     const { event, data } = request.body;
     logger.info(`paystackWebhook: received event "${event}"`);
+    console.log("pastackwebhook data: ", data);
 
     if (event !== "charge.success") {
         console.log("not a successful charge", event);
         return response.status(200).json({ message: "Event ignored" });
     }
 
-    const { customer, amount, currency, reference } = data;
+    const { customer, amount, currency, reference, metadata } = data;
 
-    if (customer?.first_name || currency) {
-        // Handle Course Paystack Callback
-        
-        const email = customer.email;
-        const name = [customer.first_name, customer.last_name].filter(Boolean).join(" ") || email;
-        const phone = customer.phone || "";
-
-        logger.info("paystackWebhook: successful payment", {
-            email,
-            name,
-            phone,
-            reference,
-            amount,
-            currency,
-        });
-
-        try {
-            await upsertContact({ email, name, phone });
-        } catch (err) {
-            // Log but still return 200 so Paystack does not retry
-            logger.error("paystackWebhook: FG Funnels upsert failed", {
-                error: err.message,
-                email,
-            });
-        }
-
+    if (metadata && metadata.sessionId) {
+        logger.info(`Processing AppSheet update for Session: ${metadata.sessionId}`);
+        await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: metadata.sessionId, amount });
     } else {
-        const sessionId = event.data.reference; // This matches AppSheet Key Column
-        // const amount = event.data.amount / 100;
-
-        try {
-            const tableName = "Sessions";
-            
-            const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
-
-            const response = await fetch(appsheetUrl, {
-                method: "POST",
-                headers: {
-                    "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    "Action": "Edit",
-                    "Properties": {
-                        "Locale": "en-US",
-                        "Timezone": "E. Africa Standard Time"
-                    },
-                    "Rows": [
-                        {
-                            "id": sessionId,
-                            "deposit_paid": "Yes",
-                            // "Amount_Paid": amount,
-                        }
-                    ]
-                })
-            });
-
-            const result = await response.json();
-            console.log("AppSheet Update Result:", result);
-
-        } catch (error) {
-            console.error("AppSheet API Error:", error);
-        }
-        
-    }    
+        await handleGHLContactUpsert({ customer, reference, amount, currency });
+    }
 
     response.status(200).json({
         success: true,
@@ -1008,19 +1040,20 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACK_SECRE
 });
 
 export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
-    const { to, amount, sessionId, phone } = request.body;
+    const { to, sessionId, type, clientId } = request.body;
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
+    const amount = type === "Gertrudes" ? 2000 : 1000;
 
-    const urlParams = `amount=${amount}&sessionId=${sessionId}&phone=${phone}`;
+    const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}`;
 
     const whatsappPayload = {
         messaging_product: "whatsapp",
         to: to, // Format: 254712345678
         type: "template",
         template: {
-            name: "payment_link_mpesa",
-            language: { code: "en_US" },
+            name: "paymentrequest",
+            language: { code: "en" },
             components: [
                 {
                     type: "button",
