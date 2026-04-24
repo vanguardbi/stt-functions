@@ -1043,7 +1043,7 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
     const { to, sessionId, type, clientId } = request.body;
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
-    const amount = type === "Gertrudes" ? 2000 : 1000;
+    const amount = type === "Gertrudes" ? 2100 : 2250;
 
     const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}`;
 
