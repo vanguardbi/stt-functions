@@ -821,6 +821,7 @@ export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", 
 export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET_TEST"] }, async (request, response) => {
 
     const { amount, sessionId, clientId } = request.query;
+    const tempAmount = 1000;
 
     try {
         const uniqueReference = `${sessionId}_${Date.now()}`;
@@ -834,7 +835,7 @@ export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_K
             },
             body: JSON.stringify({
                 email: email,
-                amount: amount * 100, // KES cents
+                amount: tempAmount * 100, // KES cents
                 currency: "KES",
                 reference: uniqueReference,
                 channels: ["mobile_money"],
@@ -1043,7 +1044,8 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
     const { to, sessionId, type, clientId } = request.body;
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
-    const amount = type === "Gertrudes" ? 2100 : 2250;
+    // const amount = type === "Gertrudes" ? 2100 : 2250;
+    const amount = 1000;
 
     const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}`;
 
