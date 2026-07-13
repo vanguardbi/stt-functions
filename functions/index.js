@@ -1019,24 +1019,39 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
     logger.info(`paystackWebhook: received event "${event}"`);
     console.log("pastackwebhook data: ", data);
 
-    if (event !== "charge.success") {
-        console.log("not a successful charge", event);
-        return response.status(200).json({ message: "Event ignored" });
+    try {
+        if (event === "charge.success") {
+            const { customer, amount, currency, reference, metadata } = data;
+
+            if (metadata && metadata.sessionId) {
+                logger.info(`Processing AppSheet update for Session: ${metadata.sessionId}`);
+                await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: metadata.sessionId, amount });
+            } else {
+                await handleGHLContactUpsert({ customer, reference, amount, currency });
+            }
+
+        } else if (event === "refund.processed" || event === "refund.failed") {
+            logger.info(`paystackWebhook: refund event for transaction ${data.transaction_reference}`);
+            await handleRefundUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, data, status: event });
+
+        } else {
+            console.log("not a handled event", event);
+            return response.status(200).json({ message: "Event ignored" });
+        }
+
+        response.status(200).json({
+            success: true,
+            message: "Event processed"
+        });
+    } catch (error) {
+        logger.error("paystackWebhook: error processing event", error);
+        // Still return 200 so Paystack doesn't retry
+        response.status(200).json({
+            success: false,
+            message: "Event received but processing failed"
+        });
     }
-
-    const { customer, amount, currency, reference, metadata } = data;
-
-    if (metadata && metadata.sessionId) {
-        logger.info(`Processing AppSheet update for Session: ${metadata.sessionId}`);
-        await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: metadata.sessionId, amount });
-    } else {
-        await handleGHLContactUpsert({ customer, reference, amount, currency });
-    }
-
-    response.status(200).json({
-        success: true,
-        message: "Event processed"
-    });
+    
 });
 
 export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
@@ -1095,3 +1110,86 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
         });
     }
 });
+
+export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KEY" ] }, async (request, response) => {
+
+    const { transactionReference, amount, reason } = request.body; // amount optional (partial refund), in KES
+
+    if (!transactionReference) {
+        return response.status(400).json({ success: false, message: "transactionReference is required" });
+    }
+
+    try {
+        const body = {
+            transaction: transactionReference,
+            currency: "KES",
+        };
+
+        if (amount) {
+            body.amount = amount * 100; // convert to cents
+        }
+        if (reason) {
+            body.customer_note = reason;
+        }
+
+        const paystackResponse = await fetch("https://api.paystack.co/refund", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(body),
+        });
+
+        const data = await paystackResponse.json();
+
+        if (!data.status) {
+            logger.error("Refund initiation failed:", data.message);
+            return response.status(400).json({ success: false, message: data.message || "Refund failed" });
+        }
+
+        response.status(200).json({ success: true, message: "Refund initiated", result: data.data });
+
+    } catch (err) {
+        console.error("Refund Initiation Error:", err);
+        response.status(500).send("Could not process refund. Please try again.");
+    }
+});
+
+async function handleRefundUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, data, status }) {
+    const fullReference = data.transaction_reference;
+    const sessionId = fullReference.split("_")[0]; // strip the timestamp appended in startPayment
+    const refundAmount = data.amount / 100;
+
+    try {
+        const tableName = "Sessions";
+        const appsheetUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(tableName)}/Action`;
+
+        const response = await fetch(appsheetUrl, {
+            method: "POST",
+            headers: {
+                "ApplicationAccessKey": APPSHEET_ACCESS_KEY,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                "Action": "Edit",
+                "Properties": {
+                    "Locale": "en-US",
+                    "Timezone": "E. Africa Standard Time"
+                },
+                "Rows": [
+                    {
+                        "id": sessionId,
+                        "refund_status": status === "refund.processed" ? "Y" : "N",
+                        "refund_amount": refundAmount,
+                    }
+                ]
+            })
+        });
+
+        const result = await response.json();
+        console.log("AppSheet Refund Update Result:", result);
+    } catch (error) {
+        console.error("AppSheet Refund Update Error:", error);
+    }
+}
