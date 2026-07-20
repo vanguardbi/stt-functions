@@ -1195,3 +1195,109 @@ async function handleRefundUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, data, 
         console.error("AppSheet Refund Update Error:", error);
     }
 }
+
+// Values must match the existing hyphen family already in the Clients 'Years' column.
+const ENQUIRY_YEARS = ["under_1_year", "under_2_years", "1-2_years", "3-4_years", "5+_years"];
+
+export const submitEnquiry = onRequest({ cors: true, secrets: ["APPSHEET_APP_ID", "APPSHEET_ACCESS_KEY", "TURNSTILE_SECRET"] }, async (request, response) => {
+
+    if (request.method !== "POST") {
+        return response.status(405).json({ success: false, message: "Method not allowed" });
+    }
+
+    const APPSHEET_APP_ID = process.env.APPSHEET_APP_ID;
+    const APPSHEET_ACCESS_KEY = process.env.APPSHEET_ACCESS_KEY;
+    const TABLE_NAME = "Clients";
+
+    const body = request.body || {};
+
+    const turnstileToken = body["cf-turnstile-response"];
+    if (!turnstileToken) {
+        return response.status(403).json({ success: false, message: "Verification required" });
+    }
+
+    try {
+        const verifyResponse = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+                secret: process.env.TURNSTILE_SECRET,
+                response: turnstileToken,
+                remoteip: (request.headers["x-forwarded-for"] || "").split(",")[0].trim(),
+            }),
+        });
+        const verifyResult = await verifyResponse.json();
+        if (!verifyResult.success) {
+            logger.warn("Turnstile verification failed:", verifyResult["error-codes"]);
+            return response.status(403).json({ success: false, message: "Verification failed" });
+        }
+    } catch (error) {
+        logger.error("Turnstile verification error:", error);
+        return response.status(502).json({ success: false, message: "Could not verify request" });
+    }
+
+    const firstName = (body.firstName || "").trim();
+    const lastName = (body.lastName || "").trim();
+    const phone = (body.phone || "").trim();
+    const email = (body.email || "").trim();
+    const years = (body.years || "").trim();
+    const concern = (body.concern || "").trim();
+    const insured = (body.insured || "").trim();
+
+    if (!firstName || !phone || !email || !years || !insured) {
+        return response.status(400).json({ success: false, message: "Missing required fields" });
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+        return response.status(400).json({ success: false, message: "Invalid email" });
+    }
+    if (!ENQUIRY_YEARS.includes(years)) {
+        return response.status(400).json({ success: false, message: "Invalid age range" });
+    }
+    if (insured !== "Yes" && insured !== "No") {
+        return response.status(400).json({ success: false, message: "Invalid insured value" });
+    }
+
+    try {
+        const apiUrl = `https://www.appsheet.com/api/v2/apps/${APPSHEET_APP_ID}/tables/${encodeURIComponent(TABLE_NAME)}/Action`;
+
+        const appsheetResponse = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "applicationAccessKey": APPSHEET_ACCESS_KEY
+            },
+            body: JSON.stringify({
+                Action: "Add",
+                Properties: {
+                    Locale: "en-US",
+                    Timezone: "E. Africa Standard Time"
+                },
+                Rows: [{
+                    "First Name": firstName,
+                    "Last Name": lastName,
+                    "Mobile": phone,
+                    "Email": email,
+                    "Years": years,
+                    "Concern": concern,
+                    "Insured": insured === "Yes" ? "Y" : "N",
+                    "Source": "Website",
+                    "Form Name": "Get In Touch Form",
+                }]
+            })
+        });
+
+        const responseText = await appsheetResponse.text();
+
+        if (!appsheetResponse.ok) {
+            logger.error(`AppSheet API Error: ${appsheetResponse.status} - ${responseText}`);
+            return response.status(502).json({ success: false, message: "Could not save enquiry" });
+        }
+
+        logger.info(`Enquiry saved to AppSheet for ${email}`);
+        return response.status(200).json({ success: true, message: "Enquiry received" });
+
+    } catch (error) {
+        logger.error("Enquiry submission error:", error);
+        return response.status(500).json({ success: false, message: "Could not save enquiry" });
+    }
+});
