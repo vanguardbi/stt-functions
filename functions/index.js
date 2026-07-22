@@ -879,6 +879,20 @@ function verifySignature(rawBody, signature) {
   return false;
 }
 
+function getWebhookEnvironment(rawBody, signature) {
+  const keys = [
+    { mode: "live", key: PAYSTACK_SECRET_LIVE },
+    { mode: "test", key: PAYSTACK_SECRET_TEST }
+  ];
+
+  for (const item of keys) {
+    if (!item.key) continue;
+    const hash = crypto.createHmac("sha512", item.key).update(rawBody).digest("hex");
+    if (hash === signature) return item.mode; // Returns "live" or "test"
+  }
+  return null; // Invalid signature
+}
+
 const ghlHeaders = () => ({
   Authorization: `Bearer ${FG_API_KEY}`,
   "Content-Type": "application/json",
@@ -1011,12 +1025,17 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
     const SECRET = process.env.PAYSTACK_SECRET_KEY;
 
     const signature = request.headers["x-paystack-signature"];
-    if (!signature || !verifySignature(request.rawBody, signature)) {
+
+    const mode = getWebhookEnvironment(request.rawBody, signature);
+
+    if (!signature || !mode) {
         logger.warn("paystackWebhook: invalid signature — request rejected");
         return response.status(401).send("Unauthorized");
     }
 
     const { event, data } = request.body;
+    const isTest = mode === "test";
+    logger.info(`Received ${event} in ${mode} mode`);
     logger.info(`paystackWebhook: received event "${event}"`);
     console.log("pastackwebhook data: ", data);
 
@@ -1034,6 +1053,9 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
         } else if (event === "refund.processed" || event === "refund.failed") {
             logger.info(`paystackWebhook: refund event for transaction ${data.transaction_reference}`);
             await handleRefundUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, data, status: event });
+            if (isTest) {
+                logger.info(`Test mode refund on webhook for transaction ${data.transaction_reference}`);
+            }
 
         } else {
             console.log("not a handled event", event);
@@ -1113,13 +1135,15 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
     }
 });
 
-export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KEY" ] }, async (request, response) => {
+export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KEY", "PAYSTACKSECRET_TEST", "PAYSTACK_SECRET_LIVE" ] }, async (request, response) => {
 
-    const { transactionReference, amount, reason } = request.body; // amount optional (partial refund), in KES
+    const { transactionReference, amount, reason, isTest } = request.body; // amount optional (partial refund), in KES
 
     if (!transactionReference) {
         return response.status(400).json({ success: false, message: "transactionReference is required" });
     }
+
+    const SECRET_KEY = isTest ? process.env.PAYSTACKSECRET_TEST : process.env.PAYSTACK_SECRET_KEY;
 
     try {
         const body = {
@@ -1137,7 +1161,7 @@ export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KE
         const paystackResponse = await fetch("https://api.paystack.co/refund", {
             method: "POST",
             headers: {
-                "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                "Authorization": `Bearer ${SECRET_KEY}`,
                 "Content-Type": "application/json",
             },
             body: JSON.stringify(body),
