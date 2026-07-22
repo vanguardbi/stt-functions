@@ -818,10 +818,12 @@ export const syncToSupabase = onRequest({ cors: true, secrets: ["SUPABASE_URL", 
     }
 });
 
-export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_KEY", "PAYSTACK_SECRET_TEST"] }, async (request, response) => {
+export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACKSECRET_LIVE", "PAYSTACKSECRET_TEST"] }, async (request, response) => {
 
-    const { amount, sessionId, clientId } = request.query;
+    const { amount, sessionId, clientId, isTest } = request.query;
     const tempAmount = 1000;
+    const testMode = isTest === "true";
+    const PAYSTACK_KEY = testMode ? process.env.PAYSTACKSECRET_TEST : process.env.PAYSTACKSECRET_LIVE;
 
     try {
         const uniqueReference = `${sessionId}_${Date.now()}`;
@@ -830,7 +832,7 @@ export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_K
         const paystackResponse = await fetch("https://api.paystack.co/transaction/initialize", {
             method: "POST",
             headers: {
-                "Authorization": `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+                "Authorization": `Bearer ${PAYSTACK_KEY}`,
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
@@ -866,18 +868,6 @@ export const startPayment = onRequest({ cors: true, secrets: ["PAYSTACK_SECRET_K
         response.status(500).send("Could not start payment. Please try again.");
     }
 });
-
-function verifySignature(rawBody, signature) {
-  for (const secret of [PAYSTACK_SECRET_LIVE, PAYSTACK_SECRET_TEST]) {
-    if (!secret) continue;
-    const hash = crypto
-      .createHmac("sha512", secret)
-      .update(rawBody)
-      .digest("hex");
-    if (hash === signature) return true;
-  }
-  return false;
-}
 
 function getWebhookEnvironment(rawBody, signature) {
   const keys = [
@@ -1078,13 +1068,13 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
 });
 
 export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
-    const { to, sessionId, type, clientId } = request.body;
+    const { to, sessionId, type, clientId, isTest } = request.body;
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
     const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
     // const amount = type === "Gertrudes" ? 2100 : 2250;
     const amount = 1000;
 
-    const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}`;
+    const urlParams = `?amount=${amount}&sessionId=${sessionId}&clientId=${clientId}${isTest ? '&isTest=true' : ''}`;
 
     const whatsappPayload = {
         messaging_product: "whatsapp",
@@ -1135,7 +1125,7 @@ export const sendWhatsappPayment = onRequest({ cors: true, secrets: ["WHATSAPP_P
     }
 });
 
-export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KEY", "PAYSTACKSECRET_TEST", "PAYSTACK_SECRET_LIVE" ] }, async (request, response) => {
+export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACKSECRET_LIVE", "PAYSTACKSECRET_TEST" ] }, async (request, response) => {
 
     const { transactionReference, amount, reason, isTest } = request.body; // amount optional (partial refund), in KES
 
@@ -1143,7 +1133,7 @@ export const startRefund = onRequest({ cors: true, secrets:[ "PAYSTACK_SECRET_KE
         return response.status(400).json({ success: false, message: "transactionReference is required" });
     }
 
-    const SECRET_KEY = isTest ? process.env.PAYSTACKSECRET_TEST : process.env.PAYSTACK_SECRET_KEY;
+    const SECRET_KEY = isTest ? process.env.PAYSTACKSECRET_TEST : process.env.PAYSTACKSECRET_LIVE;
 
     try {
         const body = {
