@@ -968,8 +968,8 @@ async function handleGHLContactUpsert({ customer, reference, amount, currency })
     }
 }
 
-async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference, amount }) {
-    const sessionId = reference;
+async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, transactionSessionId, transactionReference, amount }) {
+    const sessionId = transactionSessionId;
     const deposit_amount = amount / 100;
 
     try {
@@ -994,6 +994,7 @@ async function handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, refe
                         "id": sessionId,
                         "deposit_paid": "Yes",
                         "deposit_amount": deposit_amount,
+                        "transactionReference": transactionReference
                     }
                 ]
             })
@@ -1032,10 +1033,16 @@ export const paystackWebhook = onRequest({ cors: true, secrets: ["PAYSTACKSECRET
     try {
         if (event === "charge.success") {
             const { customer, amount, currency, reference, metadata } = data;
+            console.log("transactionReference", reference);
 
             if (metadata && metadata.sessionId) {
                 logger.info(`Processing AppSheet update for Session: ${metadata.sessionId}`);
-                await handleAppSheetUpdate({ APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, reference: metadata.sessionId, amount });
+                await handleAppSheetUpdate({ 
+                    APPSHEET_APP_ID, APPSHEET_ACCESS_KEY, 
+                    transactionSessionId: metadata.sessionId, 
+                    transactionReference: reference,   
+                    amount
+                });
             } else {
                 await handleGHLContactUpsert({ customer, reference, amount, currency });
             }
