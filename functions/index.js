@@ -102,13 +102,40 @@ function parseDateTimeToIso(dateTimeStr) {
     }
 }
 
+function formatObjectToPlainText(obj, indentLevel = 0) {
+    if (typeof obj === 'string') return obj;
+    if (typeof obj !== 'object' || obj === null) return String(obj);
+
+    let result = "";
+    const indent = " ".repeat(indentLevel);
+
+    if (Array.isArray(obj)) {
+        obj.forEach((item) => {
+            if (typeof item === "object" && item !== null) {
+                result += formatObjectToPlainText(item, indentLevel + 2) + "\n";
+            } else {
+                result += `${indent}- ${item}\n`;
+            }
+        });
+        return result;
+    }
+
+    for (const [key, value] of Object.entries(obj)) {
+        if (typeof value === "object" && value !== null) {
+            result += `\n${indent}${key}:\n${formatObjectToPlainText(value, indentLevel + 2)}`;
+        } else {
+            result += `${indent}${key}: ${value}\n`;
+        }
+    }
+    return result.trim();
+}
+
 async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript: rawTranscript, name, tracks, nextSessionPlans, sessionNotes }) {
     try {
         const vertexAI = new VertexAI({
             project: "forestfoods",
             location: 'us-central1',
             googleAuthOptions: {
-                // keyFilename: "./sac2.json",
                 credentials: VERTEX_CREDENTIALS_JSON,
                 scopes: ['https://www.googleapis.com/auth/cloud-platform'],
             },
@@ -121,6 +148,7 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
                 topP: 0.8,
                 topK: 40,
                 maxOutputTokens: 8192,
+                responseMimeType: "application/json", // Guarantees valid JSON output
             },
         });
         const today = dayjs().format("DD/MM/YYYY");
@@ -165,11 +193,10 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
             .replace('{nextSessionPlans}', nextSessionPlans
                 .split(/[\n,]+/)
                 .map((o, i) => `${'-'} ${o.trim()}`)
-                .join('\n'));;
+                .join('\n'));
 
         if (sessionNotes && sessionNotes.trim() !== "") {
             const notesSection = `\nSession Notes:\n${sessionNotes}\n`;
-            
             formattedTemplate = formattedTemplate.replace("Signed:", `${notesSection}\nSigned:`);
         }
 
@@ -216,10 +243,30 @@ async function processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcri
         }
         
         const parsedResult = JSON.parse(cleanedText);
-        const summaryDoc = parsedResult.summary;
+        let summaryDoc = parsedResult.summary;
+
+        // Automatically format summary into clean plain text if Gemini returned an Object or Object string
+        if (typeof summaryDoc === 'object' && summaryDoc !== null) {
+            summaryDoc = formatObjectToPlainText(summaryDoc);
+        } else if (typeof summaryDoc === 'string' && summaryDoc.trim().startsWith('{')) {
+            try {
+                const parsedJSON = JSON.parse(summaryDoc);
+                summaryDoc = formatObjectToPlainText(parsedJSON);
+            } catch (e) {
+                // Keep as string if it's already plain text
+            }
+        }
+
         const url = await createGoogleDoc(summaryDoc);
         console.log("url", url);
-        return { parsedResult, url };
+
+        return { 
+            parsedResult: {
+                ...parsedResult,
+                summary: summaryDoc
+            }, 
+            url 
+        };
     } catch (error) {
         console.error('Error processing transcript with Vertex AI:', error);
         throw error;
@@ -236,6 +283,8 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
         return response.status(405).json({ success: false, message: "Method not allowed" });
     }
 
+    console.log("Request", request?.body);
+
     const authHeader = request.headers.authorization || "";
 
     const match = authHeader.match(/^Bearer (.*)$/);
@@ -249,6 +298,8 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
 
     if (error || !user) {
         return response.status(403).json({ success: false, message: "Not authorized to access this route" });
+    } else {
+        console.log("user", user);
     }
 
     const { audioUrl, sessionId, name, tracks, nextSessionPlans, sessionNotes } = request.body;
@@ -274,6 +325,7 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
 
         const transcript = result.results.channels[0].alternatives[0].transcript;
         console.log("Deepgram transcription complete.", transcript);
+
 
         const vertexResult = await processTranscriptWithVertexAI({ VERTEX_CREDENTIALS_JSON, transcript, name, tracks, nextSessionPlans, sessionNotes });
 
@@ -340,7 +392,7 @@ export const generateTranscript = onRequest({ timeoutSeconds: 540, memory: '2GB'
     }
 });
 
-export async function createGoogleDoc(summaryText) {
+export async function createGoogleDoc(summaryInput) {
     const folderId = '18W-BP-I-O8Wdykwp2tY9vWX5hMdJ1oWO';
     const auth = new google.auth.GoogleAuth({
         credentials: mainServiceAccount,
@@ -352,6 +404,14 @@ export async function createGoogleDoc(summaryText) {
 
     const docs = google.docs({ version: "v1", auth });
     const drive = google.drive({ version: "v3", auth });
+
+    // Guarantee that summaryText is a plain text string primitive
+    let summaryText = summaryInput;
+    if (typeof summaryInput === "object" && summaryInput !== null) {
+        summaryText = formatObjectToPlainText(summaryInput);
+    } else {
+        summaryText = String(summaryInput || "");
+    }
 
     try {
         const createRes = await drive.files.create({
@@ -371,6 +431,7 @@ export async function createGoogleDoc(summaryText) {
                 location: { index: 1 }
             }
         }];
+
         await docs.documents.batchUpdate({
             documentId: docId,
             requestBody: {
@@ -449,7 +510,6 @@ export async function createGoogleDoc(summaryText) {
                 }
             });
         }
-
 
         await drive.permissions.create({
             fileId: docId,
