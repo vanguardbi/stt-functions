@@ -694,9 +694,9 @@ export const whatsappWebhook = onRequest({ cors: true, secrets: ["WHATSAPP_ACCES
 export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"] }, async (request, response) => {
 
     const WHATSAPP_ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
-    const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID; 
+    const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 
-    const { recipientNumber, messageText, type, templateName, templateLanguage } = request.body;
+    const { recipientNumber, messageText, type, templateName, templateLanguage, templateVariables } = request.body;
 
     if (!recipientNumber || !type) {
         return response.status(400).json({
@@ -729,6 +729,18 @@ export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_P
             type: "template",
             template: { "name": templateName, "language": { "code": templateLanguage } },
         };
+
+        if (templateVariables && Array.isArray(templateVariables) && templateVariables.length > 0) {
+            payload.template.components = [
+                {
+                    type: "body",
+                    parameters: templateVariables.map(param => ({
+                        type: "text",
+                        text: String(param)
+                    }))
+                }
+            ];
+        }
     }
 
     try {
@@ -742,8 +754,15 @@ export const sendWhatsappMessage = onRequest({ cors: true, secrets: ["WHATSAPP_P
         });
         const apiResponse = await res.json();
 
-        console.log("WhatsApp Message Sent:", apiResponse);
-        return response.status(200).send({ success: true, data: apiResponse?.data });
+        console.log("WhatsApp Message Response:", apiResponse);
+
+        if (!res?.ok) {
+            return response.status(res.status).send({
+                success: false,
+                error: apiResponse || "Failed to send WhatsApp message"
+            });
+        }
+        return response.status(200).send({ success: true, data: apiResponse?.messages });
 
     } catch (error) {
         console.error("Error sending WhatsApp message:", error.response?.data || error.message);
